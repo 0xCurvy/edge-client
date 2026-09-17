@@ -90,7 +90,7 @@ opentelemetry_sdk = { version = "0.32.1", optional = true }
 url = { version = "2.5.8", optional = true }
 validator = { version = "0.21.0", optional = true }
 
-hopr-lib = { git = "https://github.com/hoprnet/hoprnet", rev = "896ffac490", features = [
+hopr-lib = { git = "https://github.com/hoprnet/hoprnet", rev = "11b5f1b6ec187b671a6aaa305bc3a01f516ba6ca", features = [
   "session-client",
   "serde",
 ] }
@@ -130,8 +130,3 @@ anyhow = "1.0.104"
 [profile.tracer]
 inherits = "release"
 debug-assertions = true
-
-# TEMPORARY (pool-arbitration preview): hopr-lib at the hoprnet master arbiter tip pulls the
-# unpublished hopr-utilities main branch. Remove once hopr-utilities is published and hoprnet merges.
-[patch.crates-io]
-hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", branch = "kauki/feat/parallelize/pool-arbitration" }

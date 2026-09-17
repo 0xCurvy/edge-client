@@ -332,6 +332,32 @@ impl Edgli {
         self.hopr.clone()
     }
 
+    /// Subscribes to live `gvpn:exit` changes through the already-connected chain connector.
+    pub fn subscribe_exit_nodes(
+        &self,
+    ) -> anyhow::Result<
+        impl futures::Stream<Item = crate::discovery::ExitNodeUpdate> + Send + 'static,
+    > {
+        use hopr_lib::api::node::HasChainApi;
+
+        Ok(crate::discovery::subscribe_exit_nodes(
+            self.hopr.chain_api(),
+        )?)
+    }
+
+    /// Maintains a live exit-node registry seeded with [`crate::discovery::list_exit_nodes`].
+    pub fn watch_exit_nodes(
+        &self,
+        initial: Vec<crate::discovery::ExitNodeInfo>,
+    ) -> anyhow::Result<crate::discovery::ExitNodeRegistry> {
+        use hopr_lib::api::node::HasChainApi;
+
+        Ok(crate::discovery::watch_exit_nodes(
+            initial,
+            self.hopr.chain_api().clone(),
+        )?)
+    }
+
     /// The node's on-chain address.
     ///
     /// Convenience wrapper replacing the removed `Hopr::me_onchain()` method.

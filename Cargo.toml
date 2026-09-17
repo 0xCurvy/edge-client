@@ -81,7 +81,7 @@ opentelemetry_sdk = { version = "0.32.1", optional = true }
 # tracing-opentelemetry = { version = "0.32.0", optional = true }
 url = { version = "2.5.8", optional = true }
 
-hopr-lib = { git = "https://github.com/hoprnet/hoprnet", branch = "release/4.0", features = [
+hopr-lib = { git = "https://github.com/hoprnet/hoprnet", branch = "kauki/fix/transport/packet-pipeline-concurrency-defaults-r40", features = [
   "session-client",
   "serde",
 ] }
@@ -122,3 +122,8 @@ anyhow = "1.0.104"
 [profile.tracer]
 inherits = "release"
 debug-assertions = true
+
+# TEMPORARY (pool-arbitration preview): hopr-lib at the hoprnet release/4.0 arbiter branch pulls the
+# unpublished hopr-utilities compat/v4 branch. Remove once hopr-utilities is published and #8425 merges.
+[patch.crates-io]
+hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", branch = "kauki/feat/parallelize/pool-arbitration-v4" }

@@ -487,8 +487,7 @@ impl Edgli {
         crate::strategy::pix_ssa_quota(self.hopr.config())
     }
 
-    /// `base` with PIX switched on: the `UsePIX` capability added, and `pix_ssa_quota` filled from
-    /// this node's own configuration.
+    /// `base` with PIX switched on: the `UsePIX` capability added.
     ///
     /// Every other field of `base` is passed through, so the caller keeps control of routing,
     /// SURB management and flow control.
@@ -497,9 +496,10 @@ impl Edgli {
         &self,
         base: hopr_lib::HoprSessionClientConfig,
     ) -> anyhow::Result<hopr_lib::HoprSessionClientConfig> {
+        let _ = self.pix_ssa_quota()?;
+
         Ok(hopr_lib::HoprSessionClientConfig {
             capabilities: base.capabilities | hopr_lib::SessionCapability::UsePIX,
-            pix_ssa_quota: Some(self.pix_ssa_quota()?),
             ..base
         })
     }

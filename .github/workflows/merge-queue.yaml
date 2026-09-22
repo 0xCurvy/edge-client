@@ -23,8 +23,6 @@ concurrency:
 jobs:
   integration-throughput:
     name: Integration throughput # must match the required-check context exactly
-    # `main` only, and always v5: `main` repinned hopr-lib to hoprnet `master` in #151, so it IS
-    # the v5 stack. `release/4.1` is v4 and is not gated here.
     if: >-
       (github.event_name == 'merge_group'
         && github.event.merge_group.base_ref == 'refs/heads/main')
@@ -37,8 +35,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Narrowed to what the two calls below need: `contents: write` to POST a repository
-      # dispatch, `actions: read` to list and watch the run it starts.
       - name: Generate GitHub App token
         id: bot-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -47,8 +43,6 @@ jobs:
           private-key: ${{ secrets.GH_APP_HOPRNET_BOT_PRIVATE_KEY }}
           owner: hoprnet
           repositories: hopr-integration-tests
-          permission-contents: write
-          permission-actions: read
       # The dispatch returns no run id and the API does not expose a run's payload, so the wait
       # step finds the run by this marker in its title.
       - name: Build a run marker

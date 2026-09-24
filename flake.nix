@@ -2,7 +2,7 @@
   description = "HOPR Edge client";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -16,11 +16,6 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
 
     rust-overlay.url = "github:oxalica/rust-overlay";
-
-    advisory-db = {
-      url = "github:rustsec/advisory-db";
-      flake = false;
-    };
 
     # Input dependency optimization
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -43,7 +38,6 @@
       nix-lib,
       rust-overlay,
       crane,
-      advisory-db,
       treefmt-nix,
       pre-commit,
       ...
@@ -140,6 +134,9 @@
             # MY_CUSTOM_VAR = "some value";
           };
 
+          # Deny only broken-link warnings -- crate deliberately keeps 6 private-intra-doc-link warnings pointing at non-public constants.
+          denyBrokenDocLinks = "--deny rustdoc::broken_intra_doc_links";
+
           # Build *just* the cargo dependencies (of the entire workspace),
           # so we can reuse all of that work (e.g. via cachix) when running in CI
           # It is *highly* recommended to use something like cargo-hakari to avoid
@@ -184,6 +181,14 @@
                 files = "^\\.github/workflows/.*\\.ya?ml$";
                 language = "system";
                 pass_filenames = false;
+              };
+              dependabot-validator = {
+                enable = true;
+                name = "Dependabot config validator";
+                entry = "${pkgs.check-jsonschema}/bin/check-jsonschema --builtin-schema vendor.dependabot";
+                files = "\\.github/dependabot\\.yml$";
+                language = "system";
+                pass_filenames = true;
               };
             };
             tools = pkgs;
@@ -254,13 +259,75 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+                RUSTDOCFLAGS = denyBrokenDocLinks;
               }
             );
 
-            # Audit dependencies
-            audit = craneLib.cargoAudit {
-              inherit src advisory-db;
-            };
+            # rustdoc's broken-link check for the PIX feature surface, which the default-feature docs build and clippy both skip.
+            docs-pix-test = craneLib.cargoDoc (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                RUSTDOCFLAGS = denyBrokenDocLinks;
+                cargoExtraArgs = (commonArgs.cargoExtraArgs or "") + " --locked --features pix-test";
+              }
+            );
+
+            docs-pix-curvy = craneLib.cargoDoc (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                RUSTDOCFLAGS = denyBrokenDocLinks;
+                cargoExtraArgs = (commonArgs.cargoExtraArgs or "") + " --locked --features pix-curvy";
+              }
+            );
+
+            # Append to (not replace) any cargoExtraArgs set in commonArgs so
+            # shared flags keep applying to the feature-matrix checks.
+            feature-minimal = craneLib.cargoBuild (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoExtraArgs = (commonArgs.cargoExtraArgs or "") + " --locked --no-default-features";
+              }
+            );
+
+            feature-runtime-tokio = craneLib.cargoBuild (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoExtraArgs =
+                  (commonArgs.cargoExtraArgs or "") + " --locked --no-default-features --features runtime-tokio";
+              }
+            );
+
+            feature-blokli = craneLib.cargoBuild (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoExtraArgs =
+                  (commonArgs.cargoExtraArgs or "") + " --locked --no-default-features --features blokli";
+              }
+            );
+
+            # Clippy the two (mutually exclusive) PIX pools on top of the default features -- they aren't in `default` so nothing else lints them.
+            feature-pix-test = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+                cargoExtraArgs = (commonArgs.cargoExtraArgs or "") + " --locked --features pix-test";
+              }
+            );
+
+            feature-pix-curvy = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+                cargoExtraArgs = (commonArgs.cargoExtraArgs or "") + " --locked --features pix-curvy";
+              }
+            );
 
             # Audit licenses
             licenses = craneLib.cargoDeny {
@@ -340,6 +407,8 @@
           devShells.ci = pkgs.mkShell {
             packages = [ pkgs.zizmor ];
           };
+
+          apps.audit = nixLib.mkAuditApp { rustToolchainFile = ./rust-toolchain.toml; };
 
           apps.coverage-unit = {
             type = "app";

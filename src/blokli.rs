@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use hopr_chain_connector::{
-    BlockchainConnectorConfig, HoprBlockchainBasicConnector, HoprBlokliClientConfig,
+    BlockchainConnectorConfig, HoprBlockchainBasicConnector,
     blokli_client::{
         BlokliClient, BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient,
     },
-    create_blokli_client, create_trustful_safeless_hopr_blokli_connector,
+    create_trustful_safeless_hopr_blokli_connector,
 };
 use hopr_lib::{
     api::{
@@ -20,16 +20,47 @@ use hopr_lib::{
     },
     builder::Keypair,
 };
-use url::Url;
+
+use crate::endpoint::BlokliEndpoint;
 
 pub use hopr_lib::builder::ChainKeypair;
 
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_BLOKLI_URL: Url = "https://blokli.jura.gnosisvpn.io".parse().unwrap();
+/// Fallback gas price when Blokli reports none, in wei per gas — matches the
+/// connector's own `GasEstimation::default().max_fee_per_gas` (10 Gwei), the
+/// value it would sign transactions with in the same situation.
+const DEFAULT_MAX_FEE_PER_GAS: u128 = 10_000_000_000;
+
+/// Picks the EIP-1559 `max_fee_per_gas`, falling back to the legacy `gas_price`
+/// and then to [`DEFAULT_MAX_FEE_PER_GAS`] when neither is reported or parseable.
+pub(crate) fn resolve_max_fee_per_gas(
+    max_fee_per_gas: Option<&str>,
+    gas_price: Option<&str>,
+) -> u128 {
+    max_fee_per_gas
+        .and_then(|v| v.parse().ok())
+        .or_else(|| gas_price.and_then(|v| v.parse().ok()))
+        .unwrap_or(DEFAULT_MAX_FEE_PER_GAS)
 }
 
-fn build_safeless_blokli_client_config(blokli_provider: Option<Url>) -> HoprBlokliClientConfig {
-    HoprBlokliClientConfig::new(blokli_provider.unwrap_or_else(|| DEFAULT_BLOKLI_URL.clone()))
+/// Queries the chain's current `max_fee_per_gas` (wei per gas) from Blokli.
+///
+/// `hopr-chain-connector` parses these gas values but keeps them crate-private
+/// and does not surface them through `ChainValues`, so the raw Blokli query is
+/// the only way to reach them. A failed query is an error; a chain that simply
+/// reports no gas price falls back per [`resolve_max_fee_per_gas`].
+pub(crate) async fn query_max_fee_per_gas<C: BlokliQueryClient>(
+    client: &C,
+) -> anyhow::Result<u128> {
+    let info = client.query_chain_info().await?;
+    let resolved =
+        resolve_max_fee_per_gas(info.max_fee_per_gas.as_deref(), info.gas_price.as_deref());
+    tracing::debug!(
+        max_fee_per_gas = ?info.max_fee_per_gas,
+        gas_price = ?info.gas_price,
+        resolved,
+        "resolved chain gas price"
+    );
+    Ok(resolved)
 }
 
 /// Constructs a fully-wired [`IncentiveOperations`] handle backed by a Blokli client.
@@ -37,12 +68,15 @@ fn build_safeless_blokli_client_config(blokli_provider: Option<Url>) -> HoprBlok
 /// This is the only public entry point for obtaining an `IncentiveOperations` impl —
 /// the underlying [`BlokliClient`] and connector are constructed internally and
 /// never exposed to callers.
+///
+/// The endpoint's DNS override is honoured, so on-boarding works in environments
+/// where system DNS cannot resolve the Blokli host.
 pub async fn make_incentive_operations(
-    blokli_url: Option<Url>,
+    blokli_endpoint: BlokliEndpoint,
     chain_key: &ChainKeypair,
     connector_config: Option<BlockchainConnectorConfig>,
 ) -> anyhow::Result<Box<dyn IncentiveOperations>> {
-    let interactor = SafelessInteractor::new(blokli_url, chain_key, connector_config).await?;
+    let interactor = SafelessInteractor::new(blokli_endpoint, chain_key, connector_config).await?;
     Ok(Box::new(interactor))
 }
 
@@ -52,7 +86,9 @@ pub struct TicketStats {
     pub ticket_price: Balance<WxHOPR>,
     /// Minimum winning probability enforced by the network.
     ///
-    /// Call `.as_f64()` (via [`hopr_lib::UnitaryFloatOps`]) to convert to f64.
+    /// Call `.as_f64()` (via
+    /// [`UnitaryFloatOps`](hopr_lib::api::types::primitive::prelude::UnitaryFloatOps)) to convert
+    /// to f64.
     pub winning_probability: WinningProbability,
 }
 
@@ -76,6 +112,9 @@ pub trait IncentiveOperations: Send + Sync {
 
     /// Fetch current on-chain ticket pricing parameters.
     async fn ticket_stats(&self) -> anyhow::Result<TicketStats>;
+
+    /// Fetch the chain's current EIP-1559 `max_fee_per_gas`, in wei per gas.
+    async fn max_fee_per_gas(&self) -> anyhow::Result<u128>;
 
     /// Returns what this key-pair still owes before being fully up and running,
     /// verified against on-chain state: the one-time key-binding fee burned from
@@ -107,12 +146,11 @@ pub(crate) struct SafelessInteractor<C = BlokliClient> {
 
 impl SafelessInteractor<BlokliClient> {
     pub(crate) async fn new(
-        blokli_provider: Option<Url>,
+        blokli_endpoint: BlokliEndpoint,
         chain_key: &ChainKeypair,
         connector_config: Option<BlockchainConnectorConfig>,
     ) -> anyhow::Result<Self> {
-        let config = build_safeless_blokli_client_config(blokli_provider);
-        Self::new_with_client(create_blokli_client(config), chain_key, connector_config).await
+        Self::new_with_client(blokli_endpoint.build_client(), chain_key, connector_config).await
     }
 }
 
@@ -211,6 +249,10 @@ where
         })
     }
 
+    pub async fn max_fee_per_gas(&self) -> anyhow::Result<u128> {
+        query_max_fee_per_gas(self.connector.client()).await
+    }
+
     pub async fn compute_costs_to_start(&self) -> anyhow::Result<crate::strategy::StartupCosts> {
         let me = self.chain_key.public().to_address();
         let safe_deployed = self.retrieve_safe().await?.is_some();
@@ -255,6 +297,10 @@ where
         SafelessInteractor::ticket_stats(self).await
     }
 
+    async fn max_fee_per_gas(&self) -> anyhow::Result<u128> {
+        SafelessInteractor::max_fee_per_gas(self).await
+    }
+
     async fn compute_costs_to_start(&self) -> anyhow::Result<crate::strategy::StartupCosts> {
         SafelessInteractor::compute_costs_to_start(self).await
     }
@@ -284,24 +330,35 @@ mod tests {
     use hopr_chain_connector::{errors::ConnectorError, testing::BlokliTestStateBuilder};
 
     #[test]
-    fn default_blokli_url_is_correct() {
+    fn resolve_max_fee_per_gas_prefers_eip1559_value() {
         assert_eq!(
-            DEFAULT_BLOKLI_URL.as_str(),
-            "https://blokli.jura.gnosisvpn.io/"
+            resolve_max_fee_per_gas(Some("2000000000"), Some("1000000000")),
+            2_000_000_000
         );
     }
 
     #[test]
-    fn build_safeless_blokli_client_config_uses_default_url() {
-        let config = build_safeless_blokli_client_config(None);
-        assert_eq!(config.url, *DEFAULT_BLOKLI_URL);
+    fn resolve_max_fee_per_gas_falls_back_to_legacy_gas_price() {
+        assert_eq!(
+            resolve_max_fee_per_gas(None, Some("1500000000")),
+            1_500_000_000
+        );
+        // An unparseable EIP-1559 value must not shadow a usable legacy one.
+        assert_eq!(
+            resolve_max_fee_per_gas(Some(""), Some("1500000000")),
+            1_500_000_000
+        );
     }
 
     #[test]
-    fn build_safeless_blokli_client_config_uses_custom_url() {
-        let custom_url: Url = "https://custom.blokli.example.com".parse().unwrap();
-        let config = build_safeless_blokli_client_config(Some(custom_url.clone()));
-        assert_eq!(config.url, custom_url);
+    fn resolve_max_fee_per_gas_falls_back_to_default() {
+        // Neither reported, and unparseable values (which must not be treated as
+        // a free chain) both land on the connector's own default.
+        assert_eq!(resolve_max_fee_per_gas(None, None), DEFAULT_MAX_FEE_PER_GAS);
+        assert_eq!(
+            resolve_max_fee_per_gas(Some("not a number"), None),
+            DEFAULT_MAX_FEE_PER_GAS
+        );
     }
 
     #[test]
@@ -346,7 +403,7 @@ mod tests {
             .with_balances([(node, XDaiBalance::new_base(10))])
             .with_balances([(recipient, HoprBalance::zero())])
             .with_balances([(recipient, XDaiBalance::zero())])
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("anvil-localhost")
             .build_dynamic_client(placeholder_module_addr())
     }
 
@@ -422,7 +479,7 @@ mod tests {
                 XDaiBalance::new_base(10),
                 HoprBalance::new_base(100),
             )
-            .with_hopr_network_chain_info("rotsee")
+            .with_hopr_network_chain_info("anvil-localhost")
             .build_dynamic_client(placeholder_module_addr());
         let interactor = SafelessInteractor::new_with_client(client, &chain_key, None).await?;
 

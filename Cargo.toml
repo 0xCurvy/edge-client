@@ -1,12 +1,21 @@
 [package]
 name = "edgli"
-version = "3.3.1"
+version = "5.0.0"
 authors = ["HOPR Association <tech@hoprnet.org>"]
 edition = "2024"
 description = "Light client implementing the minimum HOPR protocol to serve as an entry node into the mixnet."
 homepage = "https://hoprnet.org/"
 repository = "https://github.com/hoprnet/edge-client"
 license = "GPL-3.0-only"
+
+# Declared explicitly (instead of relying on src/main.rs auto-discovery) so that
+# feature-specific builds (`--no-default-features`) skip the binary instead of
+# failing to compile it: the binary drives the concrete `Edgli` client, which
+# requires both a runtime and the blokli connector.
+[[bin]]
+name = "edgli"
+path = "src/main.rs"
+required-features = ["runtime-tokio", "blokli"]
 
 [features]
 default = ["runtime-tokio", "blokli"]
@@ -31,33 +40,43 @@ telemetry = [
   "dep:tracing-opentelemetry",
 ]
 testing = ["hopr-lib/testing"]
-blokli = []
+blokli = ["dep:tokio", "dep:url", "dep:serde", "dep:serde_json"]
 
-# To use profiling:
-# 1. Set RUSTFLAGS="--cfg tokio_unstable" before building
-# 2. Enable the 'prof' feature: cargo build --feature prof
-prof = [
-  "dep:console-subscriber",
-] # must be built with 'tokio_unstable': https://github.com/tokio-rs/console/tree/main/console-subscriber
+# PIX settlement: Entry deposits wxHOPR per Session. Pulls runtime-tokio, which the strategy needs to run.
+pix = ["runtime-tokio", "dep:validator"]
+
+# secp256k1 deposit addresses -- tests/demos only; mutually exclusive with pix-curvy.
+pix-test = ["pix", "hopr-lib/pix-secp256k1", "hopr-strategy/strategy-pix-test"]
+
+# Baby JubJub (anonymous) deposit addresses -- stub, panics on first deposit; wired now so it stays linted; mutually exclusive with pix-test.
+pix-curvy = ["pix", "hopr-lib/pix-bjj", "hopr-strategy/strategy-pix-curvy"]
+
+# tokio-console profiling of the `edgli` binary (see init_logger in src/main.rs). Build with
+# the `tracer` profile so TRACE-level task spans stay compiled in (see [profile.tracer]):
+#   cargo build --profile tracer --features prof
+# `.cargo/config.toml` already supplies `--cfg tokio_unstable`; do not set RUSTFLAGS.
+prof = ["dep:console-subscriber"]
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
+bytesize = "2.7.0"
 smart-default = "0.7.1"
 async-signal = "0.2.14"
-async-trait = "0.1.89"
+async-trait = "0.1.91"
 cfg-if = "1.0.4"
-clap = { version = "4.6.1", features = ["derive", "env", "string"] }
+clap = { version = "4.6.5", features = ["derive", "env", "string"] }
 console-subscriber = { version = "0.5.0", optional = true }
-futures = "0.3.32"
+futures = "0.3.33"
 multiaddr = "0.18.2"
-lazy_static = "1.5.0"
 signal-hook = "0.4.4"
 serde_yaml = { version = "0.9.34" }
 strum = { version = "0.28.0", features = ["derive"] }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = [
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = [
   "rt-multi-thread",
   "macros",
+  "sync",
+  "time",
   "tracing",
 ], optional = true }
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
@@ -79,22 +98,22 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 ], optional = true }
 opentelemetry_sdk = { version = "0.32.1", optional = true }
 tracing-opentelemetry = { version = "0.33.0", optional = true }
-url = "2.5.8"
+url = { version = "2.5.8", optional = true }
+validator = { version = "0.21.0", optional = true }
 
-hopr-lib = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722", features = [
+hopr-lib = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
   "session-client",
   "serde",
 ] }
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722", features = [
-  "runtime-tokio",
-] }
-hopr-ct-full-network = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722" }
-hopr-strategy = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722", features = [
-  "strategy-channel-lifecycle",
-] }
-hopr-ticket-manager = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722" }
-hopr-network-graph = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722" }
-hopr-transport-p2p = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722" }
+# Copied verbatim from the pinned hoprnet rev's own workspace Cargo.toml -- a skew here puts two `hopr-api` majors on either side of the strategy boundary, which are two unrelated traits.
+hopr-chain-connector = { version = "0.26.0", features = ["runtime-tokio"] }
+hopr-ct-full-network = { version = "0.6.0" }
+hopr-strategy = { version = "5.1.0", features = ["strategy-channel-lifecycle"] }
+hopr-ticket-manager = { version = "0.7.0" }
+hopr-network-graph = { version = "0.7.0" }
+hopr-transport-p2p = { version = "0.11.0" }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # Target-specific dependencies for memory allocators
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -103,23 +122,24 @@ mimalloc = { version = "0.1.52", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", rev = "118c4951f907bae5ca39083404f88357f2fa3722", features = [
+# `testing` provides the blokli test emulator used by the src/blokli.rs unit tests. Same version as the normal dependency above, or the tests link a second copy of the connector.
+hopr-chain-connector = { version = "0.26.0", features = [
   "runtime-tokio",
   "testing",
 ] }
-tokio = { version = "1.52.3", features = ["full", "process"] }
-reqwest = { version = "0.13.4", default-features = false, features = [
-  "rustls",
-  "json",
-] }
-tempfile = "3.27.0"
-sha2 = "0.11.0"
-nix = { version = "0.31.3", features = ["signal"] }
-rand = "0.10.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-test-log = { version = "0.2.21", features = ["trace"] }
+# `full` for the async unit tests in src/ (#[tokio::test], spawn, time, sync).
+tokio = { version = "1.53.1", features = ["full"] }
 
 [build-dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
+
+# tokio-console build target for the `prof` binary. hopr-lib forces
+# `tracing/release_max_level_debug`, which compiles out TRACE callsites (incl. tokio's task
+# instrumentation) in release. That cap only fires under `cfg(not(debug_assertions))`, so
+# turning debug-asserts back on makes it inert and STATIC_MAX_LEVEL falls through to TRACE —
+# tokio-console then sees the task spans. Optimizations stay on (release) so the profiled run
+# reflects real timings. Build with:
+#   cargo build --profile tracer --features prof
+[profile.tracer]
+inherits = "release"
+debug-assertions = true

@@ -50,12 +50,12 @@ jobs:
       pull-requests: write
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           disable-sudo: true
           egress-policy: audit
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/labeler@77a4082b841706ac431479b7e2bb11216ffef250 # main on 20.02.2025
@@ -71,26 +71,95 @@ jobs:
           if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
             gh pr edit "$PR_NUMBER" --add-label "external"
           fi
+  validate-release-branch-deps:
+    name: Release branch dependencies
+    # Only PRs onto a `release/*` branch, which is where tracking a hoprnet release branch is the
+    # rule. Development elsewhere has to be able to pin a rev: hoprnet does not publish `hopr-lib`,
+    # so work that depends on an unreleased change has a git rev and nothing else until a release
+    # branch carries it.
+    if: >-
+      github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/')
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every hoprnet git dependency must track a release branch
+        run: |
+          set -euo pipefail
+
+          # Cargo forbids `branch` and `rev` together, so the branch lives in the
+          # manifest and the resolved commit in the lock. A bare `rev` pin therefore
+          # loses the branch entirely, and nothing else notices: the build still
+          # succeeds against whatever commit was pinned, however stale, and the drift
+          # only surfaces as behaviour that does not match the release it claims.
+          fail=0
+
+          # Manifests: any line naming the hoprnet repo must carry branch = "release/...".
+          # Matched on `hoprnet/hoprnet` rather than a full URL literal, so a `.git` suffix or a
+          # different scheme still counts. The lock check below is the authoritative one -- it
+          # sees the resolved source however the manifest was spelled, including a multi-line
+          # [dependencies.hopr-lib] table this line-based scan would miss entirely.
+          while IFS= read -r line; do
+            case "${line}" in
+              *'branch = "release/'*) ;;
+              *) echo "::error::not on a release branch: ${line}"; fail=1 ;;
+            esac
+          done < <(grep -nE 'git *= *"[^"]*hoprnet/hoprnet' Cargo.toml || true)
+
+          # Lock: the resolved source must record the same, so a stale lock cannot
+          # quietly outlive a corrected manifest.
+          while IFS= read -r src; do
+            case "${src}" in
+              *'?branch=release%2F'*) ;;
+              *) echo "::error::lock entry is not from a release branch: ${src}"; fail=1 ;;
+            esac
+          done < <(grep -o 'source = "git+https://github.com/hoprnet/hoprnet[^"]*"' Cargo.lock | sort -u || true)
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::hoprnet dependencies must use branch = \"release/<x.y>\"; a bare rev pin is not accepted"
+            exit 1
+          fi
+
+          echo "All hoprnet git dependencies track a release branch:"
+          grep -n 'git = "https://github.com/hoprnet/hoprnet"' Cargo.toml || true
+          grep -o 'source = "git+https://github.com/hoprnet/hoprnet[^"]*"' Cargo.lock | sort -u || true
   checks:
     name: Check
+    # In the merge queue we don't want to re-run the heavy checks, but their
+    # contexts (`Check / *`) are required and must report on the merge group or
+    # the queue stalls. So the job still runs on merge_group; the reusable
+    # workflow's `enable`/skip booleans are turned off there, which skips the work
+    # while each `Check / *` still reports (green). Only Integration throughput
+    # does real work in the queue (see merge-queue.yaml). `!= 'merge_group'` keeps
+    # normal PR behaviour untouched.
     uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@d0cffaf9e9209c8eca00e8c74e82ac3f5f3cf7bb # workflow-checks-v2
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      format: ${{ github.event_name != 'merge_group' }}
+      pre_commit: ${{ github.event_name != 'merge_group' }}
+      lint: ${{ github.event_name != 'merge_group' }}
+      audit: ${{ github.event_name != 'merge_group' }}
       lint_command: "nix build -L .#checks.x86_64-linux.clippy"
       deps: false
-      audit_command: "nix build -L .#checks.x86_64-linux.audit"
+      audit_command: "nix run -L .#audit"
       runner_small: depot-ubuntu-24.04
       runner_large: depot-ubuntu-24.04-8
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   tests:
     name: Test
+    # Runs on merge_group too, but the enable booleans are off there so the
+    # `Test / *` contexts report (skipped = passing) without re-running (see `checks`).
     uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@798d791de5c5485c3043049781dfd0938539a36a # workflow-tests-v6
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
-      enable_unit_tests: true
+      enable_unit_tests: ${{ github.event_name != 'merge_group' }}
       unit_test_command: "nix develop -c cargo nextest run --no-tests=pass"
-      enable_unit_coverage: true
+      enable_unit_coverage: ${{ github.event_name != 'merge_group' }}
       unit_coverage_command: "nix run .#coverage-unit"
       runner_unit: depot-ubuntu-24.04-8
       test_timeout: 30
@@ -98,6 +167,8 @@ jobs:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   build-library:
     name: Library ${{ matrix.architecture }}
+    # Runs on merge_group too; `enabled` is off there so `Library … / Build`
+    # reports (skipped = passing) without rebuilding (see `checks`).
     strategy:
       fail-fast: false
       matrix:
@@ -122,6 +193,6 @@ jobs:
       architecture: ${{ matrix.architecture }}
       build_command: ${{ matrix.build_command }}
       runner: ${{ matrix.runner }}
-      enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}
+      enabled: ${{ github.event_name != 'merge_group' && (matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label)) }}
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

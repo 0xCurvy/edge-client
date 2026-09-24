@@ -1,12 +1,9 @@
 use std::collections::HashSet;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::future::{AbortHandle, abortable};
-use hopr_chain_connector::{
-    BlockchainConnectorConfig, create_blokli_client, create_trustful_hopr_blokli_connector,
-};
+use hopr_chain_connector::{BlockchainConnectorConfig, create_trustful_hopr_blokli_connector};
 use hopr_ct_full_network::ProberConfig as FullNetworkProberConfig;
 use hopr_lib::api::{
     chain::{ChainReadSafeOperations, ChainValues as _, SafeSelector},
@@ -28,29 +25,20 @@ use strum::{AsRefStr, Display, EnumString};
 use tracing::info;
 
 #[cfg(feature = "blokli")]
-use crate::DEFAULT_BLOKLI_URL;
-#[cfg(feature = "blokli")]
-use hopr_chain_connector::HoprBlokliClientConfig;
+use crate::endpoint::BlokliEndpoint;
 
 use crate::errors::EdgliError;
 
-#[cfg(feature = "blokli")]
-fn build_blokli_client_config(
-    blokli_url: Option<&str>,
-    blokli_dns_override: Option<(IpAddr, Option<u16>)>,
-) -> Result<HoprBlokliClientConfig, EdgliError> {
-    let url = match blokli_url {
-        Some(url) => url
-            .parse()
-            .map_err(|e| EdgliError::ConfigError(format!("invalid Blokli URL '{url}': {e}")))?,
-        None => DEFAULT_BLOKLI_URL.clone(),
-    };
+/// The deposit address type this build's `HoprPixSpec` produces.
+#[cfg(feature = "pix")]
+type SpecDepositAddress =
+    <hopr_lib::exports::transport::HoprPixSpec as hopr_lib::exports::transport::PixSpec>::DepositAddress;
 
-    Ok(HoprBlokliClientConfig {
-        url,
-        dns_override: blokli_dns_override,
-    })
-}
+/// The deposit pool this build selected, for the startup log line.
+#[cfg(all(feature = "pix-test", not(feature = "pix-curvy")))]
+const PIX_POOL: &str = "non-anonymous-secp256k1";
+#[cfg(all(feature = "pix-curvy", not(feature = "pix-test")))]
+const PIX_POOL: &str = "curvy";
 
 /// The concrete HOPR edge node type used by this client.
 pub type HoprEdgeClient = hopr_lib::Hopr<
@@ -130,12 +118,10 @@ fn probeable_addresses(addrs: Vec<Multiaddr>, probe_local_addresses: bool) -> Ve
 /// Returns an [`AbortHandle`] that stops the closure task when aborted.
 /// `Edgli` is kept alive for the entire duration of `f` so that background tasks
 /// remain active until `f` completes or the returned [`AbortHandle`] is used to cancel it.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_hopr_edge_node_with<F, T>(
     cfg: HoprLibConfig,
     hopr_keys: HoprKeys,
-    blokli_url: Option<String>,
-    blokli_dns_override: Option<(IpAddr, Option<u16>)>,
+    blokli_endpoint: BlokliEndpoint,
     blokli_connector_config: Option<BlockchainConnectorConfig>,
     probe_local_addresses: bool,
     f: F,
@@ -148,8 +134,7 @@ where
     let edgli = Edgli::new(
         cfg,
         hopr_keys,
-        blokli_url,
-        blokli_dns_override,
+        blokli_endpoint,
         blokli_connector_config,
         probe_local_addresses,
         visitor,
@@ -177,6 +162,16 @@ pub struct Edgli {
     hopr: Arc<HoprEdgeClient>,
     /// The node's packet-layer public key, stored at construction for peer-ID access.
     packet_public_key: OffchainPublicKey,
+    /// The node's chain keypair, which the plain PIX deposit pool signs with.
+    ///
+    /// Held because the pool cannot get it any other way: `HoprEdgeClient` keeps a
+    /// `NodeOnchainIdentity`, not the keypair, and exposes no accessor. Storing it is what keeps
+    /// [`Edgli::run_reactor_from_cfg`] from having to take a private key as an argument.
+    ///
+    /// Gated on the pool that reads it rather than on `pix`, so a `pix-curvy` build does not carry
+    /// a key nothing in it can use — that pool settles to Baby JubJub addresses and signs nothing.
+    #[cfg(all(feature = "pix-test", not(feature = "pix-curvy")))]
+    chain_key: ChainKeypair,
 }
 
 impl std::ops::Deref for Edgli {
@@ -195,8 +190,8 @@ impl Edgli {
     ///   before calling to control the routing strategy.  Use
     ///   [`crate::latency_path_planner_config`] to obtain a latency-optimised default.
     /// * `hopr_keys` – chain and packet keypairs
-    /// * `blokli_url` – optional Blokli client URL; defaults to the production endpoint
-    /// * `blokli_dns_override` – optional DNS override for the Blokli client
+    /// * `blokli_endpoint` – Blokli service URL and optional DNS override, built with
+    ///   [`BlokliEndpoint::new`]; there is no default URL
     /// * `blokli_connector_config` – optional connector config overrides
     /// * `probe_local_addresses` – when `true`, probe non-public (private,
     ///   loopback, link-local) peer addresses from announcements; when `false`
@@ -205,8 +200,7 @@ impl Edgli {
     pub async fn new(
         cfg: HoprLibConfig,
         hopr_keys: HoprKeys,
-        blokli_url: Option<String>,
-        blokli_dns_override: Option<(IpAddr, Option<u16>)>,
+        blokli_endpoint: BlokliEndpoint,
         blokli_connector_config: Option<BlockchainConnectorConfig>,
         probe_local_addresses: bool,
         visitor: impl Fn(EdgliInitState) + Send + 'static,
@@ -242,10 +236,7 @@ impl Edgli {
             let mut connector = create_trustful_hopr_blokli_connector(
                 chain_key,
                 blokli_config,
-                create_blokli_client(build_blokli_client_config(
-                    blokli_url.as_deref(),
-                    blokli_dns_override,
-                )?),
+                blokli_endpoint.build_client(),
                 cfg.safe_module.module_address,
             )
             .await?;
@@ -331,12 +322,40 @@ impl Edgli {
         Ok(Self {
             hopr: node,
             packet_public_key,
+            #[cfg(all(feature = "pix-test", not(feature = "pix-curvy")))]
+            chain_key: hopr_keys.chain_key,
         })
     }
 
     /// Returns the shared [`HoprEdgeClient`] handle.
     pub fn as_hopr(&self) -> Arc<HoprEdgeClient> {
         self.hopr.clone()
+    }
+
+    /// Subscribes to live `gvpn:exit` changes through the already-connected chain connector.
+    pub fn subscribe_exit_nodes(
+        &self,
+    ) -> anyhow::Result<
+        impl futures::Stream<Item = crate::discovery::ExitNodeUpdate> + Send + 'static,
+    > {
+        use hopr_lib::api::node::HasChainApi;
+
+        Ok(crate::discovery::subscribe_exit_nodes(
+            self.hopr.chain_api(),
+        )?)
+    }
+
+    /// Maintains a live exit-node registry seeded with [`crate::discovery::list_exit_nodes`].
+    pub fn watch_exit_nodes(
+        &self,
+        initial: Vec<crate::discovery::ExitNodeInfo>,
+    ) -> anyhow::Result<crate::discovery::ExitNodeRegistry> {
+        use hopr_lib::api::node::HasChainApi;
+
+        Ok(crate::discovery::watch_exit_nodes(
+            initial,
+            self.hopr.chain_api().clone(),
+        )?)
     }
 
     /// The node's on-chain address.
@@ -369,6 +388,7 @@ impl Edgli {
         let chain = self.chain_api();
         let ticket_price = chain.minimum_ticket_price().await?;
         let win_prob = chain.minimum_incoming_ticket_win_prob().await?.as_f64();
+        let max_fee_per_gas = crate::blokli::query_max_fee_per_gas(chain.client()).await?;
 
         let source = HasChainApi::identity(&*self.hopr).node_address;
         let all_channels = IncentiveChannelOperations::channels_from(&*self.hopr, source)
@@ -391,21 +411,26 @@ impl Edgli {
         // verified on-chain rather than assumed.
         // A running node cannot start without a Safe, so it is always deployed here.
         let costs = super::strategy::compute_costs_to_start(chain, Some(source), true).await?;
-        super::strategy::compute_balance_recommendation(ticket_price, win_prob, cfg, missing, costs)
+        super::strategy::compute_balance_recommendation(
+            ticket_price,
+            win_prob,
+            missing,
+            costs,
+            cfg,
+            max_fee_per_gas,
+        )
     }
 
-    /// Returns a map of data-throughput capacities keyed by [`super::strategy::CapacityAllocator`].
-    ///
-    /// Open outgoing channels are keyed by `CapacityAllocator::Peer(address)`; the
-    /// unallocated Safe balance is keyed by `CapacityAllocator::Safe`.  Each
+    /// Returns the data-throughput capacities of every wxHOPR stake the node can
+    /// draw on, as a [`super::strategy::CapacityAllocations`]: open outgoing
+    /// channels keyed by destination peer, the unallocated Safe balance, and
+    /// wxHOPR on the node EOA (deposited, not yet swept into the Safe).  Each
     /// [`super::strategy::Capacity`] holds the wxHOPR stake, the floor number
     /// of session frames it can fund at the current ticket price, and the
     /// corresponding raw byte capacity (`expected_messages × SESSION_MTU`).
     pub async fn describe_current_capacity_allocations(
         &self,
-    ) -> anyhow::Result<
-        std::collections::HashMap<super::strategy::CapacityAllocator, super::strategy::Capacity>,
-    > {
+    ) -> anyhow::Result<super::strategy::CapacityAllocations> {
         let chain = self.chain_api();
         let ticket_price = chain.minimum_ticket_price().await?;
         let win_prob = chain.minimum_incoming_ticket_win_prob().await?.as_f64();
@@ -429,29 +454,61 @@ impl Edgli {
             None => HoprBalance::zero(),
         };
 
-        let mut map = std::collections::HashMap::new();
+        let node_wxhopr: HoprBalance = chain
+            .balance(node_address)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut peer_allocations = std::collections::HashMap::new();
         for c in channels
             .into_iter()
             .filter(|c| c.status == ChannelStatus::Open)
         {
             let capacity = super::strategy::compute_capacity(c.balance, ticket_price, win_prob)?;
-            map.insert(
-                super::strategy::CapacityAllocator::Peer(c.destination),
-                capacity,
-            );
+            peer_allocations.insert(c.destination, capacity);
         }
-        map.insert(
-            super::strategy::CapacityAllocator::Safe,
-            super::strategy::compute_capacity(safe_balance, ticket_price, win_prob)?,
-        );
 
-        Ok(map)
+        Ok(super::strategy::CapacityAllocations {
+            peer_allocations,
+            node: super::strategy::compute_capacity(node_wxhopr, ticket_price, win_prob)?,
+            safe: super::strategy::compute_capacity(safe_balance, ticket_price, win_prob)?,
+        })
+    }
+
+    /// This node's own PIX dimensions, as the `PixParams` a Session announces.
+    ///
+    /// Thin wrapper over [`crate::strategy::pix_ssa_quota`] on this node's configuration; see there
+    /// for why the dimensions are derived rather than supplied. Pair with [`quota_per_ssa`] to size
+    /// the wxHOPR float a Session will need.
+    ///
+    /// [`quota_per_ssa`]: crate::strategy::quota_per_ssa
+    #[cfg(feature = "pix")]
+    pub fn pix_ssa_quota(&self) -> anyhow::Result<hopr_lib::PixParams> {
+        crate::strategy::pix_ssa_quota(self.hopr.config())
+    }
+
+    /// `base` with PIX switched on: the `UsePIX` capability added.
+    ///
+    /// Every other field of `base` is passed through, so the caller keeps control of routing,
+    /// SURB management and flow control.
+    #[cfg(feature = "pix")]
+    pub fn with_pix(
+        &self,
+        base: hopr_lib::HoprSessionClientConfig,
+    ) -> anyhow::Result<hopr_lib::HoprSessionClientConfig> {
+        let _ = self.pix_ssa_quota()?;
+
+        Ok(hopr_lib::HoprSessionClientConfig {
+            capabilities: base.capabilities | hopr_lib::SessionCapability::UsePIX,
+            ..base
+        })
     }
 
     /// Run a node with HOPR edge strategies integrated.
     ///
-    /// The default reactor runs a single [`ChannelLifecycleStrategy`] which
-    /// owns open / fund / close / finalize for outgoing payment channels.
+    /// The default reactor runs a single
+    /// [`ChannelLifecycleStrategy`](hopr_strategy::channel_lifecycle::ChannelLifecycleStrategy)
+    /// which owns open / fund / close / finalize for outgoing payment channels.
     ///
     /// Returns an [`AbortHandle`] that stops the strategy reactor when aborted.
     #[cfg(feature = "blokli")]
@@ -460,6 +517,8 @@ impl Edgli {
         cfg: super::strategy::MultiStrategyConfig,
     ) -> anyhow::Result<AbortHandle> {
         use super::strategy::EdgeStrategyKind;
+        #[cfg(feature = "pix")]
+        use hopr_strategy::pix::strategy::PixStrategy;
         use hopr_strategy::{
             channel_lifecycle::ChannelLifecycleStrategy,
             strategy::{MultiStrategy, Strategy},
@@ -467,17 +526,46 @@ impl Edgli {
 
         let node = self.hopr.clone();
 
+        // `build` became fallible in hopr-strategy 0.26. Propagate rather than unwrap: a strategy
+        // that failed to construct would otherwise leave the reactor running with nothing driving
+        // channel lifecycle, which looks like a healthy node that never opens a channel.
         let strategies = cfg
             .strategies
             .into_iter()
-            .map(|kind| -> Box<dyn Strategy + Send> {
+            .map(|kind| -> anyhow::Result<Box<dyn Strategy + Send>> {
                 match kind {
                     EdgeStrategyKind::ChannelLifecycle(sub_cfg) => {
-                        ChannelLifecycleStrategy::new(sub_cfg).build(Arc::clone(&node))
+                        Ok(ChannelLifecycleStrategy::new(*sub_cfg).build(Arc::clone(&node))?)
+                    }
+                    #[cfg(feature = "pix")]
+                    EdgeStrategyKind::Pix(sub_cfg) => {
+                        // Only trace of which pool this build picked, and anonymity differs between them -- worth logging.
+                        tracing::info!(
+                            pool = PIX_POOL,
+                            price_per_byte = %sub_cfg.strategy.price_per_byte,
+                            max_ssa_allocation = %sub_cfg.strategy.max_ssa_allocation,
+                            max_deposit_tracking_time = ?sub_cfg.pool.max_deposit_tracking_time,
+                            "enabling the PIX strategy"
+                        );
+                        // The pool checks `chain_key` against the node's identity at build time; it signs the sweep's gas top-up, which cannot go through the Safe module.
+                        #[cfg(all(feature = "pix-test", not(feature = "pix-curvy")))]
+                        let built = PixStrategy::new(sub_cfg.strategy.to_upstream())
+                            .build_non_anonymous::<_, SpecDepositAddress>(
+                            Arc::clone(&node),
+                            self.chain_key.clone(),
+                            sub_cfg.pool.to_upstream(),
+                        )?;
+                        #[cfg(all(feature = "pix-curvy", not(feature = "pix-test")))]
+                        let built = PixStrategy::new(sub_cfg.strategy.to_upstream())
+                            .build_curvy::<_, SpecDepositAddress>(
+                            Arc::clone(&node),
+                            sub_cfg.pool.to_upstream(),
+                        )?;
+                        Ok(built)
                     }
                 }
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut multi_strategy = MultiStrategy::new(strategies);
 
@@ -495,7 +583,6 @@ impl Edgli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn init_state_as_ref_matches_to_string() {
@@ -563,34 +650,6 @@ mod tests {
                 | EdgliInitState::Ready => {}
             }
         }
-    }
-
-    #[cfg(feature = "blokli")]
-    #[test]
-    fn build_blokli_client_config_uses_default_url() {
-        let config = build_blokli_client_config(None, None).unwrap();
-        assert_eq!(config.url, *DEFAULT_BLOKLI_URL);
-        assert_eq!(config.dns_override, None);
-    }
-
-    #[cfg(feature = "blokli")]
-    #[test]
-    fn build_blokli_client_config_keeps_dns_override() {
-        let dns_override = Some((IpAddr::V4(Ipv4Addr::new(10, 1, 2, 1)), Some(3002)));
-        let config =
-            build_blokli_client_config(Some("https://blokli.example.com"), dns_override).unwrap();
-        assert_eq!(config.url.as_str(), "https://blokli.example.com/");
-        assert_eq!(config.dns_override, dns_override);
-    }
-
-    #[cfg(feature = "blokli")]
-    #[test]
-    fn build_blokli_client_config_rejects_invalid_url() {
-        let error = build_blokli_client_config(Some("not a url"), None).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "configuration error: 'invalid Blokli URL 'not a url': relative URL without a base'"
-        );
     }
 
     fn ma(s: &str) -> Multiaddr {
